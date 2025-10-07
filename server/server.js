@@ -1,10 +1,13 @@
 // server/index.js
+require("dotenv").config();
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
-const dotenv = require("dotenv");
+const helmet = require("helmet");
+const compression = require("compression");
+const rateLimit = require("express-rate-limit");
 const nodemailer = require("nodemailer");
-const morgan = require("morgan"); // optional logging for requests
+const morgan = require("morgan");
 
 // Models
 const Contact = require("./models/Contact");
@@ -12,145 +15,298 @@ const Project = require("./models/Project");
 const Experience = require("./models/Experience");
 const Achievement = require("./models/Achievement");
 
-dotenv.config();
 const app = express();
 
-// ---------------------- MIDDLEWARE ----------------------
-app.use(cors({
-  origin: process.env.FRONTEND_URL || "*", // Replace * with frontend URL in production
-}));
-app.use(express.json());
-app.use(morgan("dev")); // logs requests
+// ---------------------- CONFIG ----------------------
+const isProd = process.env.NODE_ENV === "production";
+const PORT = process.env.PORT || 5000;
 
-// ---------------------- MONGODB CONNECTION ----------------------
-mongoose.connect(process.env.MONGO_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-})
-.then(() => console.log("✅ MongoDB connected"))
-.catch((err) => {
-  console.error("❌ MongoDB connection error:", err);
-  process.exit(1); // stop server if DB connection fails
+// Allow common dev origins + configured URL
+const allowedOrigins = [
+  process.env.FRONTEND_URL,
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+].filter(Boolean);
+
+// ---------------------- MIDDLEWARE ----------------------
+app.set("trust proxy", 1);
+app.use(
+  cors({
+    origin(origin, cb) {
+      // allow no origin (curl/postman) and allowed list
+      if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
+      return cb(new Error("Not allowed by CORS"));
+    },
+  })
+);
+app.use(helmet({ crossOriginResourcePolicy: false }));
+app.use(compression());
+app.use(express.json({ limit: "200kb" }));
+if (!isProd) app.use(morgan("dev"));
+
+// Rate limit (general) - 300 req/5min per IP
+const generalLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use(generalLimiter);
+
+// Contact route tighter limiter - 10 req/10min per IP
+const contactLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 10,
+  message: { error: "Too many requests, please try again later." },
+  standardHeaders: true,
+  legacyHeaders: false,
 });
 
-// ---------------------- ROOT ROUTE ----------------------
-app.get("/", (req, res) => res.send("Portfolio Backend is running"));
+// ---------------------- DB ----------------------
+if (!process.env.MONGO_URI) {
+  console.error("❌ Missing MONGO_URI in .env");
+  process.exit(1);
+}
 
-// ---------------------- CONTACT ROUTE ----------------------
-app.post("/api/contact", async (req, res) => {
-  try {
-    const { name, email, message } = req.body;
+mongoose
+  .connect(process.env.MONGO_URI)
+  .then(() => console.log("✅ MongoDB connected"))
+  .catch((err) => {
+    console.error("❌ MongoDB connection error:", err);
+    process.exit(1);
+  });
 
-    if (!name || !email || !message) {
-      return res.status(400).json({ error: "All fields are required" });
-    }
+// ---------------------- UTILS ----------------------
+const asyncHandler =
+  (fn) =>
+  (req, res, next) =>
+    Promise.resolve(fn(req, res, next)).catch(next);
 
-    const contact = new Contact({ name, email, message });
-    await contact.save();
+const EMAIL_USER = process.env.EMAIL_USER;
+const EMAIL_PASS = process.env.EMAIL_PASS;
+const SMTP_HOST = process.env.SMTP_HOST; // optional
+const SMTP_PORT = process.env.SMTP_PORT; // optional
+const EMAIL_TO = process.env.EMAIL_TO || EMAIL_USER;
 
-    const transporter = nodemailer.createTransport({
-      service: "gmail",
-      auth: {
-        user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_PASS,
-      },
+function createTransporter() {
+  if (SMTP_HOST && SMTP_PORT) {
+    return nodemailer.createTransport({
+      host: SMTP_HOST,
+      port: Number(SMTP_PORT),
+      secure: Number(SMTP_PORT) === 465,
+      auth: EMAIL_USER && EMAIL_PASS ? { user: EMAIL_USER, pass: EMAIL_PASS } : undefined,
       tls: { rejectUnauthorized: false },
     });
+  }
+  // Fallback: Gmail service (requires EMAIL_USER/EMAIL_PASS)
+  return nodemailer.createTransport({
+    service: "gmail",
+    auth: { user: EMAIL_USER, pass: EMAIL_PASS },
+    tls: { rejectUnauthorized: false },
+  });
+}
 
-    await transporter.sendMail({
-      from: process.env.EMAIL_USER,
-      to: process.env.EMAIL_USER,
-      subject: `New Contact Message from ${name}`,
-      text: `Name: ${name}\nEmail: ${email}\nMessage: ${message}`,
+// Trim helper
+const t = (v) => (typeof v === "string" ? v.trim() : v);
+
+// ---------------------- ROUTES ----------------------
+app.get("/", (_req, res) => {
+  res.json({ ok: true, message: "Portfolio Backend is running" });
+});
+
+// CONTACT
+// CONTACT (safe)
+app.post(
+  "/api/contact",
+  contactLimiter,
+  asyncHandler(async (req, res) => {
+    const t = (v) => (typeof v === "string" ? v.trim() : v);
+    const name = t(req.body.name);
+    const email = t(req.body.email);
+    const message = t(req.body.message);
+    const subject = t(req.body.subject);
+    const phone = t(req.body.phone);
+
+    if (!name || name.length < 2) {
+      return res.status(400).json({ error: "Name must be at least 2 characters" });
+    }
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: "Please provide a valid email" });
+    }
+    if (!message || message.length < 10) {
+      return res.status(400).json({ error: "Message must be at least 10 characters" });
+    }
+
+    // Save to DB (always)
+    const contact = new Contact({
+      name,
+      email: email.toLowerCase(),
+      message,
+      subject,
+      phone,
+      meta: {
+        ip: req.ip,
+        userAgent: req.headers["user-agent"],
+        page: req.get("referer"),
+      },
     });
+    await contact.save();
 
-    res.status(200).json({ message: "Message sent successfully!" });
-  } catch (error) {
-    console.error("Contact error:", error);
-    res.status(500).json({ error: "Server error. Please try again later." });
-  }
-});
+    // Email send (graceful)
+    let mailStatus = "skipped";
+    const skipEmail = process.env.SKIP_EMAIL === "true";
+    const EMAIL_USER = process.env.EMAIL_USER;
+    const EMAIL_PASS = process.env.EMAIL_PASS;
 
-// ---------------------- PROJECT ROUTES ----------------------
-app.get("/api/projects", async (req, res) => {
-  try {
-    const projects = await Project.find().sort({ createdAt: -1 });
+    if (!skipEmail && EMAIL_USER && EMAIL_PASS) {
+      try {
+        const transporter = require("nodemailer").createTransport({
+          host: process.env.SMTP_HOST || "smtp.gmail.com",
+          port: Number(process.env.SMTP_PORT || 465),
+          secure: Number(process.env.SMTP_PORT || 465) === 465, // 465: secure, 587: starttls
+          auth: { user: EMAIL_USER, pass: EMAIL_PASS },
+          tls: { rejectUnauthorized: false },
+        });
+
+        const compiledText = [
+          `Name: ${name}`,
+          `Email: ${email}`,
+          phone ? `Phone: ${phone}` : null,
+          subject ? `Subject: ${subject}` : null,
+          "",
+          message,
+        ]
+          .filter(Boolean)
+          .join("\n");
+
+        // Optional verify (comment out if slow)
+        // await transporter.verify();
+
+        await transporter.sendMail({
+          from: EMAIL_USER, // must be the authenticated account
+          to: process.env.EMAIL_TO || EMAIL_USER,
+          replyTo: email,   // user email
+          subject: `New Contact Message from ${name}`,
+          text: compiledText,
+        });
+
+        mailStatus = "sent";
+      } catch (e) {
+        mailStatus = "failed";
+        console.error("Email send failed:", e?.response || e?.message || e);
+      }
+    }
+
+    return res.status(200).json({
+      message: "Message received",
+      mail: mailStatus, // "sent" | "failed" | "skipped"
+    });
+  })
+);
+// PROJECTS
+app.get(
+  "/api/projects",
+  asyncHandler(async (_req, res) => {
+    // Prefer date desc if available, then createdAt
+    const projects = await Project.find().sort({ date: -1, createdAt: -1 }).lean();
     res.status(200).json(projects);
-  } catch (err) {
-    res.status(500).json({ error: "Failed to fetch projects" });
-  }
-});
+  })
+);
 
-app.get("/api/projects/:id", async (req, res) => {
-  try {
-    const project = await Project.findById(req.params.id);
-    if (!project) return res.status(404).json({ message: "Project not found" });
+app.get(
+  "/api/projects/:id",
+  asyncHandler(async (req, res) => {
+    const project = await Project.findById(req.params.id).lean();
+    if (!project) return res.status(404).json({ error: "Project not found" });
     res.status(200).json(project);
-  } catch (err) {
-    res.status(500).json({ error: "Failed to fetch project" });
-  }
-});
+  })
+);
 
-app.post("/api/projects", async (req, res) => {
-  try {
-    const project = new Project(req.body);
+app.post(
+  "/api/projects",
+  asyncHandler(async (req, res) => {
+    const body = req.body || {};
+    if (!body.name) return res.status(400).json({ error: "Project name is required" });
+
+    // Normalize strings
+    if (typeof body.name === "string") body.name = body.name.trim();
+    if (typeof body.description === "string") body.description = body.description.trim();
+
+    const project = new Project(body);
     await project.save();
     res.status(201).json(project);
-  } catch (err) {
-    res.status(500).json({ error: "Failed to create project" });
-  }
-});
+  })
+);
 
-app.delete("/api/projects/:id", async (req, res) => {
-  try {
-    const deletedProject = await Project.findByIdAndDelete(req.params.id);
-    if (!deletedProject) return res.status(404).json({ message: "Project not found" });
+app.delete(
+  "/api/projects/:id",
+  asyncHandler(async (req, res) => {
+    const deleted = await Project.findByIdAndDelete(req.params.id);
+    if (!deleted) return res.status(404).json({ error: "Project not found" });
     res.status(200).json({ message: "Project deleted successfully" });
-  } catch (err) {
-    res.status(500).json({ error: "Failed to delete project" });
-  }
-});
+  })
+);
 
-// ---------------------- EXPERIENCE ROUTES ----------------------
-app.get("/api/experience", async (req, res) => {
-  try {
-    const experiences = await Experience.find().sort({ createdAt: -1 });
+// EXPERIENCE
+app.get(
+  "/api/experience",
+  asyncHandler(async (_req, res) => {
+    // Prefer startDate desc if available, else createdAt
+    const experiences = await Experience.find().sort({ startDate: -1, createdAt: -1 }).lean();
     res.status(200).json(experiences);
-  } catch (err) {
-    res.status(500).json({ error: "Failed to fetch experiences" });
-  }
-});
+  })
+);
 
-app.post("/api/experience", async (req, res) => {
-  try {
-    const experience = new Experience(req.body);
-    await experience.save();
-    res.status(201).json(experience);
-  } catch (err) {
-    res.status(500).json({ error: "Failed to add experience" });
-  }
-});
+app.post(
+  "/api/experience",
+  asyncHandler(async (req, res) => {
+    const body = req.body || {};
+    if (!body.role || !body.company) {
+      return res.status(400).json({ error: "Role and company are required" });
+    }
+    const exp = new Experience(body);
+    await exp.save();
+    res.status(201).json(exp);
+  })
+);
 
-// ---------------------- ACHIEVEMENT ROUTES ----------------------
-app.get("/api/achievements", async (req, res) => {
-  try {
-    const achievements = await Achievement.find().sort({ createdAt: -1 });
+// ACHIEVEMENTS
+app.get(
+  "/api/achievements",
+  asyncHandler(async (_req, res) => {
+    // Prefer date desc if available, else createdAt
+    const achievements = await Achievement.find().sort({ date: -1, createdAt: -1 }).lean();
     res.status(200).json(achievements);
-  } catch (err) {
-    res.status(500).json({ error: "Failed to fetch achievements" });
-  }
+  })
+);
+
+app.post(
+  "/api/achievements",
+  asyncHandler(async (req, res) => {
+    const body = req.body || {};
+    if (!body.title) return res.status(400).json({ error: "Title is required" });
+    const ach = new Achievement(body);
+    await ach.save();
+    res.status(201).json(ach);
+  })
+);
+
+// ---------------------- 404 + ERROR HANDLER ----------------------
+app.use((req, res) => {
+  res.status(404).json({ error: "Not found" });
 });
 
-app.post("/api/achievements", async (req, res) => {
-  try {
-    const achievement = new Achievement(req.body);
-    await achievement.save();
-    res.status(201).json(achievement);
-  } catch (err) {
-    res.status(500).json({ error: "Failed to add achievement" });
-  }
+app.use((err, _req, res, _next) => {
+  console.error("❌ Error:", err);
+  const status = err.status || 500;
+  res.status(status).json({
+    error: err.message || "Server error",
+  });
 });
 
-// ---------------------- SERVER ----------------------
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+// ---------------------- START ----------------------
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+});
